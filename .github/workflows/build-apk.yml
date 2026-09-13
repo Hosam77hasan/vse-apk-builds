@@ -17,6 +17,14 @@ jobs:
         with:
           channel: stable
           cache: true
+      - name: Prepare the Android platform
+        # The sources pushed from the app are lib/ + the project shell — a
+        # Flutter project WITHOUT android/. The build step then fails with
+        # "No application found for TargetPlatform.android_arm64", which is
+        # what broke every cloud build: nothing ever generated the platform.
+        # Generating it here keeps the phone payload small and the build
+        # reproducible.
+        run: flutter create --platforms=android --no-pub .
       - name: Build release APK
         run: |
           flutter pub get
@@ -27,3 +35,8 @@ jobs:
           name: app-release
           path: build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
+          # Keep the APK for one week: it is downloaded to the phone right
+          # after the build, and GitHub storage is not a CDN. Older artefacts
+          # are dropped automatically instead of piling up (and expiring
+          # artifact ids are what produced "502 Artifact download failed").
+          retention-days: 7
