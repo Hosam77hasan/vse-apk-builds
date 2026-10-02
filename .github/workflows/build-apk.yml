@@ -138,54 +138,54 @@ jobs:
         run: |
           set -e
           python3 - <<'PY'
-import os, pathlib, re
+          import os, pathlib, re
 
-app_id = os.environ['APP_ID']
-code = os.environ['VERSION_CODE']
-name = os.environ['VERSION_NAME']
-p = pathlib.Path('android/app/build.gradle.kts')
-s = p.read_text(encoding='utf-8')
+          app_id = os.environ['APP_ID']
+          code = os.environ['VERSION_CODE']
+          name = os.environ['VERSION_NAME']
+          p = pathlib.Path('android/app/build.gradle.kts')
+          s = p.read_text(encoding='utf-8')
 
-# identity — `com.example.*` is rejected by Google Play.
-s = re.sub(r'namespace\s*=\s*"[^"]*"', 'namespace = "%s"' % app_id, s)
-s = re.sub(r'applicationId\s*=\s*"[^"]*"', 'applicationId = "%s"' % app_id, s)
-# flutter create writes flutter.versionCode/versionName — use REAL numbers.
-s = re.sub(r'versionCode\s*=\s*[^\n]+', 'versionCode = %s' % code, s)
-s = re.sub(r'versionName\s*=\s*[^\n]+', 'versionName = "%s"' % name, s)
+          # identity — `com.example.*` is rejected by Google Play.
+          s = re.sub(r'namespace\s*=\s*"[^"]*"', 'namespace = "%s"' % app_id, s)
+          s = re.sub(r'applicationId\s*=\s*"[^"]*"', 'applicationId = "%s"' % app_id, s)
+          # flutter create writes flutter.versionCode/versionName — use REAL numbers.
+          s = re.sub(r'versionCode\s*=\s*[^\n]+', 'versionCode = %s' % code, s)
+          s = re.sub(r'versionName\s*=\s*[^\n]+', 'versionName = "%s"' % name, s)
 
-header = (
-    'import java.util.Properties\n'
-    'import java.io.FileInputStream\n\n'
-    'val keystoreProperties = Properties()\n'
-    'val keystorePropertiesFile = rootProject.file("key.properties")\n'
-    'if (keystorePropertiesFile.exists()) {\n'
-    '    keystoreProperties.load(FileInputStream(keystorePropertiesFile))\n'
-    '}\n\n'
-)
-if 'keystoreProperties' not in s:
-    s = header + s
+          header = (
+              'import java.util.Properties\n'
+              'import java.io.FileInputStream\n\n'
+              'val keystoreProperties = Properties()\n'
+              'val keystorePropertiesFile = rootProject.file("key.properties")\n'
+              'if (keystorePropertiesFile.exists()) {\n'
+              '    keystoreProperties.load(FileInputStream(keystorePropertiesFile))\n'
+              '}\n\n'
+          )
+          if 'keystoreProperties' not in s:
+              s = header + s
 
-signing = (
-    '    signingConfigs {\n'
-    '        create("release") {\n'
-    '            keyAlias = keystoreProperties["keyAlias"] as String\n'
-    '            keyPassword = keystoreProperties["keyPassword"] as String\n'
-    '            storeFile = file(keystoreProperties["storeFile"] as String)\n'
-    '            storePassword = keystoreProperties["storePassword"] as String\n'
-    '        }\n'
-    '    }\n'
-)
-before = s
-s = s.replace('    buildTypes {', signing + '    buildTypes {', 1)
-if s != before:
-    s = s.replace(
-        'signingConfigs.getByName("debug")',
-        'signingConfigs.getByName("release")',
-    )
+          signing = (
+              '    signingConfigs {\n'
+              '        create("release") {\n'
+              '            keyAlias = keystoreProperties["keyAlias"] as String\n'
+              '            keyPassword = keystoreProperties["keyPassword"] as String\n'
+              '            storeFile = file(keystoreProperties["storeFile"] as String)\n'
+              '            storePassword = keystoreProperties["storePassword"] as String\n'
+              '        }\n'
+              '    }\n'
+          )
+          before = s
+          s = s.replace('    buildTypes {', signing + '    buildTypes {', 1)
+          if s != before:
+              s = s.replace(
+                  'signingConfigs.getByName("debug")',
+                  'signingConfigs.getByName("release")',
+              )
 
-p.write_text(s, encoding='utf-8')
-print('✅ identity=%s versionCode=%s versionName=%s' % (app_id, code, name))
-PY
+          p.write_text(s, encoding='utf-8')
+          print('✅ identity=%s versionCode=%s versionName=%s' % (app_id, code, name))
+          PY
 
       - name: Build the release APK and the Play bundle
         run: |
