@@ -1,5 +1,21 @@
 name: Build APK
 
+# ── The ONE definition of VSE's cloud build ──────────────────────────────────
+# Read by `github_build.workflowYaml()` and written into the build repo (and
+# into every per-build branch, so `workflow_dispatch` finds it on that ref).
+#
+# 1. A PERMANENT signing key, PER PROJECT. A build runs on a throw-away branch
+#    that is deleted right afterwards, so a keystore generated inside the run
+#    would be lost forever and the project could never be updated — Google ties
+#    every future upload of an app to the key it was first signed with. The key
+#    lives at `.vse-keys/<slug>.*` on the SHARED branch and is reused by every
+#    later build of that same project.
+# 2. A real identity and a version that only grows: `com.vse.<app>` instead of
+#    `flutter create`'s `com.example.*` (which Google Play rejects), and a
+#    versionCode read from `.vse-versions/<slug>` and incremented per build
+#    (Android refuses an install whose versionCode does not increase).
+# 3. An AAB next to the APK: the APK installs on the phone, the AAB is what
+#    Google Play accepts for a new release.
 on:
   workflow_dispatch:
     inputs:
@@ -7,36 +23,200 @@ on:
         description: 'VSE project name'
         required: true
         default: 'vse-app'
+      app_id:
+        description: 'Android applicationId (com.vse.<slug>)'
+        required: true
+        default: 'com.vse.app'
+      keys_branch:
+        description: 'Branch holding the permanent key/version'
+        required: true
+        default: 'main'
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
+
+      - name: Resolve the slug and the version
+        env:
+          PROJECT_NAME: ${{ inputs.project_name }}
+          KEYS_BRANCH: ${{ inputs.keys_branch }}
+        run: |
+          set -e
+          SLUG=$(printf '%s' "$PROJECT_NAME" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed -E 's/[^a-z0-9]+/_/g; s/^_+//; s/_+$//')
+          [ -z "$SLUG" ] && SLUG="vse_app"
+          # A Java package segment may not start with a digit.
+          case "$SLUG" in [0-9]*) SLUG="app_$SLUG" ;; esac
+
+          FILE=".vse-versions/${SLUG}"
+          CURRENT=$(gh api "/repos/${GITHUB_REPOSITORY}/contents/${FILE}?ref=${KEYS_BRANCH}" \
+            --jq '.content' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+          case "$CURRENT" in ''|*[!0-9]*) CURRENT=0 ;; esac
+          NEXT=$((CURRENT + 1))
+          if gh api -X PUT "/repos/${GITHUB_REPOSITORY}/contents/${FILE}" \
+               -f message="vse: versionCode $NEXT for $SLUG" \
+               -f content="$(printf '%s' "$NEXT" | base64 -w0)" \
+               -f branch="${KEYS_BRANCH}" >/dev/null 2>&1; then
+            echo "🔢 versionCode $NEXT (stored for the next build)"
+          else
+            echo "⚠️ could not persist the counter — using $NEXT for this build"
+          fi
+
+          {
+            echo "SLUG=$SLUG"
+            echo "VERSION_CODE=$NEXT"
+            echo "VERSION_NAME=1.0.${NEXT}"
+          } >> "$GITHUB_ENV"
+          echo "🆔 slug=$SLUG app_id=${{ inputs.app_id }} version=1.0.${NEXT}"
+
       - name: Prepare the Android platform
         # The sources pushed from the app are lib/ + the project shell — a
-        # Flutter project WITHOUT android/. The build step then fails with
-        # "No application found for TargetPlatform.android_arm64", which is
-        # what broke every cloud build: nothing ever generated the platform.
-        # Generating it here keeps the phone payload small and the build
-        # reproducible.
+        # Flutter project WITHOUT android/. Generating it here keeps the phone
+        # payload small and the build reproducible.
         run: flutter create --platforms=android --no-pub .
-      - name: Build release APK
+
+      - name: Install the PERMANENT release key for this project
+        env:
+          KEYS_BRANCH: ${{ inputs.keys_branch }}
+          PROJECT_NAME: ${{ inputs.project_name }}
+        run: |
+          set -e
+          KEY=".vse-keys/${SLUG}.keystore"
+          PROPS=".vse-keys/${SLUG}.properties"
+
+          fetch() {
+            gh api "/repos/${GITHUB_REPOSITORY}/contents/$1?ref=${KEYS_BRANCH}" \
+              --jq '.content' 2>/dev/null | tr -d '\n' | base64 -d > "$2"
+          }
+
+          if fetch "$KEY" "release.keystore" && fetch "$PROPS" "release.properties"; then
+            echo "🔑 reused the EXISTING key of $SLUG — this app stays updatable"
+          else
+            echo "🔑 first build of $SLUG — generating its permanent key"
+            STORE_PASS=$(openssl rand -hex 16)
+            keytool -genkeypair -v -keystore "release.keystore" \
+              -alias "vse-${SLUG}" -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$STORE_PASS" -keypass "$STORE_PASS" \
+              -dname "CN=${PROJECT_NAME}, OU=Generated, O=VSE, L=Cairo, ST=Cairo, C=EG"
+            {
+              echo "storePassword=$STORE_PASS"
+              echo "keyPassword=$STORE_PASS"
+              echo "keyAlias=vse-${SLUG}"
+              echo "storeFile=release.keystore"
+            } > release.properties
+
+            put() {
+              gh api -X PUT "/repos/${GITHUB_REPOSITORY}/contents/$1" \
+                -f message="vse: permanent signing key for $SLUG" \
+                -f content="$(base64 -w0 "$2")" \
+                -f branch="${KEYS_BRANCH}" >/dev/null \
+                || echo "⚠️ could not store $1 (this build continues)"
+            }
+            put "$KEY" "release.keystore"
+            put "$PROPS" "release.properties"
+          fi
+
+          # Both files land where the Gradle patch expects them.
+          mkdir -p android/app
+          cp release.keystore android/app/release.keystore
+          cp release.properties android/key.properties
+
+      - name: Set the identity, the version and release signing
+        env:
+          APP_ID: ${{ inputs.app_id }}
+        run: |
+          set -e
+          python3 - <<'PY'
+import os, pathlib, re
+
+app_id = os.environ['APP_ID']
+code = os.environ['VERSION_CODE']
+name = os.environ['VERSION_NAME']
+p = pathlib.Path('android/app/build.gradle.kts')
+s = p.read_text(encoding='utf-8')
+
+# identity — `com.example.*` is rejected by Google Play.
+s = re.sub(r'namespace\s*=\s*"[^"]*"', 'namespace = "%s"' % app_id, s)
+s = re.sub(r'applicationId\s*=\s*"[^"]*"', 'applicationId = "%s"' % app_id, s)
+# flutter create writes flutter.versionCode/versionName — use REAL numbers.
+s = re.sub(r'versionCode\s*=\s*[^\n]+', 'versionCode = %s' % code, s)
+s = re.sub(r'versionName\s*=\s*[^\n]+', 'versionName = "%s"' % name, s)
+
+header = (
+    'import java.util.Properties\n'
+    'import java.io.FileInputStream\n\n'
+    'val keystoreProperties = Properties()\n'
+    'val keystorePropertiesFile = rootProject.file("key.properties")\n'
+    'if (keystorePropertiesFile.exists()) {\n'
+    '    keystoreProperties.load(FileInputStream(keystorePropertiesFile))\n'
+    '}\n\n'
+)
+if 'keystoreProperties' not in s:
+    s = header + s
+
+signing = (
+    '    signingConfigs {\n'
+    '        create("release") {\n'
+    '            keyAlias = keystoreProperties["keyAlias"] as String\n'
+    '            keyPassword = keystoreProperties["keyPassword"] as String\n'
+    '            storeFile = file(keystoreProperties["storeFile"] as String)\n'
+    '            storePassword = keystoreProperties["storePassword"] as String\n'
+    '        }\n'
+    '    }\n'
+)
+before = s
+s = s.replace('    buildTypes {', signing + '    buildTypes {', 1)
+if s != before:
+    s = s.replace(
+        'signingConfigs.getByName("debug")',
+        'signingConfigs.getByName("release")',
+    )
+
+p.write_text(s, encoding='utf-8')
+print('✅ identity=%s versionCode=%s versionName=%s' % (app_id, code, name))
+PY
+
+      - name: Build the release APK and the Play bundle
         run: |
           flutter pub get
           flutter build apk --release
-      - name: Upload APK artifact
+          flutter build appbundle --release
+
+      - name: Upload the APK
         uses: actions/upload-artifact@v4
         with:
           name: app-release
           path: build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
-          # Keep the APK for one week: it is downloaded to the phone right
-          # after the build, and GitHub storage is not a CDN. Older artefacts
-          # are dropped automatically instead of piling up (and expiring
-          # artifact ids are what produced "502 Artifact download failed").
+          # One week: it is downloaded to the phone right after the build, and
+          # GitHub storage is not a CDN.
+          retention-days: 7
+
+      - name: Upload the Play bundle (AAB)
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-bundle
+          path: build/app/outputs/bundle/release/app-release.aab
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload the signing key (keep it — Play ties updates to it)
+        uses: actions/upload-artifact@v4
+        with:
+          name: signing-key
+          path: |
+            android/app/release.keystore
+            android/key.properties
+          if-no-files-found: warn
           retention-days: 7
