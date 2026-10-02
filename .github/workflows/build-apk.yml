@@ -48,6 +48,10 @@ jobs:
 
       - name: Resolve the slug and the version
         env:
+          # `gh` reads GH_TOKEN, and Actions does NOT export one by default —
+          # without this every call fails silently and the versionCode counter
+          # (and the permanent signing key below) is never persisted.
+          GH_TOKEN: ${{ github.token }}
           PROJECT_NAME: ${{ inputs.project_name }}
           KEYS_BRANCH: ${{ inputs.keys_branch }}
         run: |
@@ -84,10 +88,18 @@ jobs:
         # The sources pushed from the app are lib/ + the project shell — a
         # Flutter project WITHOUT android/. Generating it here keeps the phone
         # payload small and the build reproducible.
-        run: flutter create --platforms=android --no-pub .
+        #
+        # `flutter create .` derives the package name from the DIRECTORY, and
+        # the runner's directory is the repo's own name (`vse-apk-builds`) —
+        # hyphens are illegal in a Dart package name, so the step aborted on
+        # every build. The slug is already computed, is always a legal Dart
+        # identifier, and is stable per project, so it is passed explicitly.
+        # The real applicationId is stamped by the step below anyway.
+        run: flutter create --project-name "$SLUG" --platforms=android --no-pub .
 
       - name: Install the PERMANENT release key for this project
         env:
+          GH_TOKEN: ${{ github.token }}
           KEYS_BRANCH: ${{ inputs.keys_branch }}
           PROJECT_NAME: ${{ inputs.project_name }}
         run: |
