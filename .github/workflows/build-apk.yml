@@ -107,10 +107,40 @@ jobs:
           KEY=".vse-keys/${SLUG}.keystore"
           PROPS=".vse-keys/${SLUG}.properties"
 
+          # Fetch into a TEMP file and only move it into place on success.
+          # Two separate bugs hid behind the obvious one-liner:
+          #   1. it redirected straight into the target, so on a 404 the shell
+          #      had ALREADY created a zero-byte `release.keystore` — keytool
+          #      then refused with "Keystore file exists, but is empty" and
+          #      every FIRST build of a project died;
+          #   2. `gh ... | base64 -d` hides gh's exit status (no pipefail, so
+          #      only the decoder's status survives) — a 404 answers `null`,
+          #      which base64 decodes to garbage that looks like a keystore.
+          # So: ask gh on its OWN and check ITS status, then decode, then
+          # require real bytes before the file is allowed to exist.
           fetch() {
-            gh api "/repos/${GITHUB_REPOSITORY}/contents/$1?ref=${KEYS_BRANCH}" \
-              --jq '.content' 2>/dev/null | tr -d '\n' | base64 -d > "$2"
+            local raw="$2.b64" tmp="$2.fetching"
+            rm -f "$raw" "$tmp"
+            if ! gh api "/repos/${GITHUB_REPOSITORY}/contents/$1?ref=${KEYS_BRANCH}" \
+                 --jq '.content' > "$raw" 2>/dev/null; then
+              rm -f "$raw"
+              return 1
+            fi
+            if ! tr -d '\n' < "$raw" | base64 -d > "$tmp" 2>/dev/null; then
+              rm -f "$raw" "$tmp"
+              return 1
+            fi
+            rm -f "$raw"
+            if [ ! -s "$tmp" ]; then
+              rm -f "$tmp"
+              return 1
+            fi
+            mv "$tmp" "$2"
           }
+
+          # Never let a half-written file from an earlier attempt survive into
+          # keytool — it refuses to overwrite anything that exists.
+          rm -f release.keystore release.properties
 
           if fetch "$KEY" "release.keystore" && fetch "$PROPS" "release.properties"; then
             echo "🔑 reused the EXISTING key of $SLUG — this app stays updatable"
