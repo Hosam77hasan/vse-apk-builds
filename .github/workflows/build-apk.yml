@@ -4,12 +4,9 @@ name: Build APK
 # Read by `github_build.workflowYaml()` and written into the build repo (and
 # into every per-build branch, so `workflow_dispatch` finds it on that ref).
 #
-# 1. A PERMANENT signing key, PER PROJECT. A build runs on a throw-away branch
-#    that is deleted right afterwards, so a keystore generated inside the run
-#    would be lost forever and the project could never be updated — Google ties
-#    every future upload of an app to the key it was first signed with. The key
-#    lives at `.vse-keys/<slug>.*` on the SHARED branch and is reused by every
-#    later build of that same project.
+# 1. A PERMANENT signing key, PER PROJECT, injected from the
+#    `VSE_SIGNING_KEYS_JSON` repository secret. Signing material is never
+#    committed to this public repository or uploaded as a workflow artifact.
 # 2. A real identity and a version that only grows: `com.vse.<app>` instead of
 #    `flutter create`'s `com.example.*` (which Google Play rejects), and a
 #    versionCode read from `.vse-versions/<slug>` and incremented per build
@@ -27,8 +24,8 @@ on:
         description: 'Android applicationId (com.vse.<slug>)'
         required: true
         default: 'com.vse.app'
-      keys_branch:
-        description: 'Branch holding the permanent key/version'
+      version_branch:
+        description: 'Branch holding the public version counter'
         required: true
         default: 'main'
 
@@ -37,7 +34,8 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -50,10 +48,10 @@ jobs:
         env:
           # `gh` reads GH_TOKEN, and Actions does NOT export one by default —
           # without this every call fails silently and the versionCode counter
-          # (and the permanent signing key below) is never persisted.
+          # is never persisted.
           GH_TOKEN: ${{ github.token }}
           PROJECT_NAME: ${{ inputs.project_name }}
-          KEYS_BRANCH: ${{ inputs.keys_branch }}
+          VERSION_BRANCH: ${{ inputs.version_branch }}
         run: |
           set -e
           SLUG=$(printf '%s' "$PROJECT_NAME" \
@@ -64,14 +62,23 @@ jobs:
           case "$SLUG" in [0-9]*) SLUG="app_$SLUG" ;; esac
 
           FILE=".vse-versions/${SLUG}"
-          CURRENT=$(gh api "/repos/${GITHUB_REPOSITORY}/contents/${FILE}?ref=${KEYS_BRANCH}" \
+          # The Contents API REQUIRES the sha of an EXISTING file on update:
+          # without it the PUT answers 422 "sha wasn't supplied", so the
+          # counter froze at 1 and every build after the first shipped the SAME
+          # versionCode — which Android refuses to update over. Read content
+          # and sha, then send the sha back only when the file already exists.
+          SHA=$(gh api "/repos/${GITHUB_REPOSITORY}/contents/${FILE}?ref=${VERSION_BRANCH}" \
+            --jq '.sha' 2>/dev/null || true)
+          CURRENT=$(gh api "/repos/${GITHUB_REPOSITORY}/contents/${FILE}?ref=${VERSION_BRANCH}" \
             --jq '.content' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
           case "$CURRENT" in ''|*[!0-9]*) CURRENT=0 ;; esac
           NEXT=$((CURRENT + 1))
-          if gh api -X PUT "/repos/${GITHUB_REPOSITORY}/contents/${FILE}" \
-               -f message="vse: versionCode $NEXT for $SLUG" \
-               -f content="$(printf '%s' "$NEXT" | base64 -w0)" \
-               -f branch="${KEYS_BRANCH}" >/dev/null 2>&1; then
+          PUT=(-X PUT "/repos/${GITHUB_REPOSITORY}/contents/${FILE}"
+            -f message="vse: versionCode $NEXT for $SLUG"
+            -f content="$(printf '%s' "$NEXT" | base64 -w0)"
+            -f branch="${VERSION_BRANCH}")
+          [ -n "$SHA" ] && PUT+=(-f sha="$SHA")
+          if gh api "${PUT[@]}" >/dev/null 2>&1; then
             echo "🔢 versionCode $NEXT (stored for the next build)"
           else
             echo "⚠️ could not persist the counter — using $NEXT for this build"
@@ -83,6 +90,19 @@ jobs:
             echo "VERSION_NAME=1.0.${NEXT}"
           } >> "$GITHUB_ENV"
           echo "🆔 slug=$SLUG app_id=${{ inputs.app_id }} version=1.0.${NEXT}"
+
+      - name: Cache the Gradle downloads
+        # Every cloud build starts on a fresh runner, so Gradle re-downloads
+        # the whole Android/Firebase dependency set before it can compile —
+        # pure waiting for the user. Keyed on the project's own pubspec.yaml:
+        # a different project (or a changed dependency set) gets its own cache,
+        # an unchanged one reuses whatever is already there.
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/caches
+          key: ${{ runner.os }}-gradle-${{ hashFiles('pubspec.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
 
       - name: Prepare the Android platform
         # The sources pushed from the app are lib/ + the project shell — a
@@ -97,82 +117,65 @@ jobs:
         # The real applicationId is stamped by the step below anyway.
         run: flutter create --project-name "$SLUG" --platforms=android --no-pub .
 
-      - name: Install the PERMANENT release key for this project
+      - name: Restore the private release key from Actions secret
         env:
-          GH_TOKEN: ${{ github.token }}
-          KEYS_BRANCH: ${{ inputs.keys_branch }}
+          SIGNING_KEYS_JSON: ${{ secrets.VSE_SIGNING_KEYS_JSON }}
           PROJECT_NAME: ${{ inputs.project_name }}
         run: |
-          set -e
-          KEY=".vse-keys/${SLUG}.keystore"
-          PROPS=".vse-keys/${SLUG}.properties"
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import pathlib
+          import re
 
-          # Fetch into a TEMP file and only move it into place on success.
-          # Two separate bugs hid behind the obvious one-liner:
-          #   1. it redirected straight into the target, so on a 404 the shell
-          #      had ALREADY created a zero-byte `release.keystore` — keytool
-          #      then refused with "Keystore file exists, but is empty" and
-          #      every FIRST build of a project died;
-          #   2. `gh ... | base64 -d` hides gh's exit status (no pipefail, so
-          #      only the decoder's status survives) — a 404 answers `null`,
-          #      which base64 decodes to garbage that looks like a keystore.
-          # So: ask gh on its OWN and check ITS status, then decode, then
-          # require real bytes before the file is allowed to exist.
-          fetch() {
-            local raw="$2.b64" tmp="$2.fetching"
-            rm -f "$raw" "$tmp"
-            if ! gh api "/repos/${GITHUB_REPOSITORY}/contents/$1?ref=${KEYS_BRANCH}" \
-                 --jq '.content' > "$raw" 2>/dev/null; then
-              rm -f "$raw"
-              return 1
-            fi
-            if ! tr -d '\n' < "$raw" | base64 -d > "$tmp" 2>/dev/null; then
-              rm -f "$raw" "$tmp"
-              return 1
-            fi
-            rm -f "$raw"
-            if [ ! -s "$tmp" ]; then
-              rm -f "$tmp"
-              return 1
-            fi
-            mv "$tmp" "$2"
-          }
+          project_name = os.environ['PROJECT_NAME'].strip().lower()
+          slug = re.sub(r'[^a-z0-9]+', '_', project_name).strip('_')
+          if not slug:
+              slug = 'vse_app'
+          if slug[0].isdigit():
+              slug = 'app_' + slug
 
-          # Never let a half-written file from an earlier attempt survive into
-          # keytool — it refuses to overwrite anything that exists.
-          rm -f release.keystore release.properties
+          raw = os.environ.get('SIGNING_KEYS_JSON', '')
+          if not raw:
+              raise SystemExit('Missing GitHub Actions secret VSE_SIGNING_KEYS_JSON')
+          try:
+              keys = json.loads(raw)
+          except json.JSONDecodeError as error:
+              raise SystemExit('VSE_SIGNING_KEYS_JSON is not valid JSON') from error
+          entry = keys.get(slug) if isinstance(keys, dict) else None
+          if not isinstance(entry, dict):
+              raise SystemExit(
+                  'No signing key configured in VSE_SIGNING_KEYS_JSON for project ' + slug
+              )
 
-          if fetch "$KEY" "release.keystore" && fetch "$PROPS" "release.properties"; then
-            echo "🔑 reused the EXISTING key of $SLUG — this app stays updatable"
-          else
-            echo "🔑 first build of $SLUG — generating its permanent key"
-            STORE_PASS=$(openssl rand -hex 16)
-            keytool -genkeypair -v -keystore "release.keystore" \
-              -alias "vse-${SLUG}" -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass "$STORE_PASS" -keypass "$STORE_PASS" \
-              -dname "CN=${PROJECT_NAME}, OU=Generated, O=VSE, L=Cairo, ST=Cairo, C=EG"
-            {
-              echo "storePassword=$STORE_PASS"
-              echo "keyPassword=$STORE_PASS"
-              echo "keyAlias=vse-${SLUG}"
-              echo "storeFile=release.keystore"
-            } > release.properties
+          required = ('keystore_base64', 'store_password', 'key_password', 'key_alias')
+          if any(not isinstance(entry.get(key), str) or not entry[key] for key in required):
+              raise SystemExit('Signing-key entry is incomplete for project ' + slug)
+          try:
+              keystore = base64.b64decode(entry['keystore_base64'], validate=True)
+          except (ValueError, base64.binascii.Error) as error:
+              raise SystemExit('Signing keystore is invalid for project ' + slug) from error
+          if not keystore:
+              raise SystemExit('Signing keystore is empty for project ' + slug)
+          if any('\n' in entry[key] or '\r' in entry[key] for key in required[1:]):
+              raise SystemExit('Signing-key properties contain invalid line breaks')
 
-            put() {
-              gh api -X PUT "/repos/${GITHUB_REPOSITORY}/contents/$1" \
-                -f message="vse: permanent signing key for $SLUG" \
-                -f content="$(base64 -w0 "$2")" \
-                -f branch="${KEYS_BRANCH}" >/dev/null \
-                || echo "⚠️ could not store $1 (this build continues)"
-            }
-            put "$KEY" "release.keystore"
-            put "$PROPS" "release.properties"
-          fi
-
-          # Both files land where the Gradle patch expects them.
-          mkdir -p android/app
-          cp release.keystore android/app/release.keystore
-          cp release.properties android/key.properties
+          keystore_path = pathlib.Path('android/app/release.keystore')
+          properties_path = pathlib.Path('android/key.properties')
+          keystore_path.write_bytes(keystore)
+          keystore_path.chmod(0o600)
+          properties_path.write_text(
+              'storePassword=' + entry['store_password'] + '\n'
+              'keyPassword=' + entry['key_password'] + '\n'
+              'keyAlias=' + entry['key_alias'] + '\n'
+              'storeFile=release.keystore\n',
+              encoding='utf-8',
+          )
+          properties_path.chmod(0o600)
+          print('Private release key installed for ' + slug)
+          PY
 
       - name: Set the identity, the version and release signing
         env:
@@ -194,6 +197,48 @@ jobs:
           # flutter create writes flutter.versionCode/versionName — use REAL numbers.
           s = re.sub(r'versionCode\s*=\s*[^\n]+', 'versionCode = %s' % code, s)
           s = re.sub(r'versionName\s*=\s*[^\n]+', 'versionName = "%s"' % name, s)
+
+          # flutter create places MainActivity in its generated `com.example`
+          # package. The manifest resolves `.MainActivity` against namespace,
+          # which is now APP_ID, so move and rename the Kotlin class as well.
+          activity_files = list(pathlib.Path('android/app/src/main').rglob('MainActivity.kt'))
+          if len(activity_files) != 1:
+              raise SystemExit(
+                  'Expected exactly one generated MainActivity.kt; found %d'
+                  % len(activity_files)
+              )
+          activity = activity_files[0]
+          activity_source = activity.read_text(encoding='utf-8')
+          package_pattern = r'(?m)^package\s+[A-Za-z0-9_.]+\s*$'
+          if not re.search(package_pattern, activity_source):
+              raise SystemExit('Generated MainActivity.kt has no package declaration')
+          activity_source = re.sub(
+              package_pattern, 'package %s' % app_id, activity_source, count=1,
+          )
+          source_root = next(
+              (parent for parent in activity.parents if parent.name in ('kotlin', 'java')),
+              None,
+          )
+          if source_root is None:
+              raise SystemExit('Could not locate the Android Kotlin source root')
+          activity_target = source_root.joinpath(*app_id.split('.'), 'MainActivity.kt')
+          activity_target.parent.mkdir(parents=True, exist_ok=True)
+          if activity_target != activity and activity_target.exists():
+              raise SystemExit('Refusing to overwrite an existing MainActivity.kt')
+          activity_target.write_text(activity_source, encoding='utf-8')
+          if activity_target != activity:
+              activity.unlink()
+
+          manifest = pathlib.Path('android/app/src/main/AndroidManifest.xml')
+          if not manifest.is_file() or not re.search(
+              r'android:name\s*=\s*["\']\.MainActivity["\']',
+              manifest.read_text(encoding='utf-8'),
+          ):
+              raise SystemExit('AndroidManifest.xml does not declare .MainActivity')
+          if not re.search(
+              r'namespace\s*=\s*["\']%s["\']' % re.escape(app_id), s,
+          ):
+              raise SystemExit('Gradle namespace does not match the MainActivity package')
 
           header = (
               'import java.util.Properties\n'
@@ -226,14 +271,114 @@ jobs:
               )
 
           p.write_text(s, encoding='utf-8')
-          print('✅ identity=%s versionCode=%s versionName=%s' % (app_id, code, name))
+          print(
+              '✅ identity=%s MainActivity=%s versionCode=%s versionName=%s'
+              % (app_id, activity_target, code, name)
+          )
           PY
 
-      - name: Build the release APK and the Play bundle
+      - name: Clean generated Flutter outputs
+        timeout-minutes: 5
+        run: flutter clean
+
+      - name: Resolve generated Flutter dependencies
+        timeout-minutes: 15
+        run: flutter pub get --verbose
+
+      - name: Patch legacy Android plugin metadata
+        timeout-minutes: 5
         run: |
-          flutter pub get
-          flutter build apk --release
-          flutter build appbundle --release
+          # TWO AGP 8-era blockers that killed EVERY real cloud build, both
+          # inside the pub-cache plugins the generated scaffold pulls in
+          # (isar_flutter_libs, geocoding_android, …):
+          #   1. `namespace` is now REQUIRED — old plugins ship only the
+          #      manifest `package` attribute, so Gradle aborts during
+          #      configuration with "Namespace not specified";
+          #   2. a module compiled against android-33 dies in
+          #      `checkReleaseAarMetadata` because its dependencies (androidx
+          #      1.4.x) demand API 34+.
+          # Fix both here, before Gradle runs: fill a missing namespace from
+          # the plugin's own manifest, and align every plugin's compileSdk
+          # with the app's (36 = what the pinned Flutter uses).
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          PUB = pathlib.Path.home() / '.pub-cache' / 'hosted' / 'pub.dev'
+
+          # The app's own compileSdk — a literal in the generated Gradle file
+          # when there is one, else Flutter's default (36).
+          target = 36
+          app_gradle = pathlib.Path('android/app/build.gradle.kts')
+          if app_gradle.is_file():
+              m = re.search(
+                  r'compileSdk\s*[= ]\s*(\d+)',
+                  app_gradle.read_text(encoding='utf-8'),
+              )
+              if m:
+                  target = int(m.group(1))
+
+          ns_fixed, sdk_fixed = [], []
+          if PUB.is_dir():
+              for gradle in sorted(PUB.glob('*/android/build.gradle*')):
+                  try:
+                      src = gradle.read_text(encoding='utf-8')
+                  except (OSError, UnicodeDecodeError):
+                      continue
+                  block = re.search(r'(?m)^[ \t]*android[ \t]*\{', src)
+                  if not block:
+                      continue  # not an Android module (or an odd layout)
+                  changed = False
+
+                  # 1) missing `namespace` (Groovy `namespace "x"` vs Kotlin
+                  #    `namespace = "x"` — the right spelling is picked below).
+                  if not re.search(r'(?m)^[ \t]*namespace[ \t]*[=(\s]', src):
+                      pkg_dir = gradle.parent.parent
+                      ns = None
+                      manifest = gradle.parent / 'src' / 'main' / 'AndroidManifest.xml'
+                      if manifest.is_file():
+                          m = re.search(
+                              r'package\s*=\s*"([^"]+)"',
+                              manifest.read_text(encoding='utf-8', errors='replace'),
+                          )
+                          if m:
+                              ns = m.group(1)
+                      if not ns:
+                          # No manifest package to inherit: a legal, unique
+                          # fallback namespace so the build still proceeds.
+                          ident = re.sub(r'[^A-Za-z0-9_]', '_', pkg_dir.name).lower()
+                          ns = 'vse.patched.' + ident
+                      line = '    namespace "%s"\n' % ns
+                      if gradle.suffix != '.gradle':
+                          line = '    namespace = "%s"\n' % ns
+                      src = src[:block.end()] + '\n' + line + src[block.end():]
+                      ns_fixed.append('%s -> %s' % (pkg_dir.name, ns))
+                      changed = True
+
+                  # 2) compileSdk below what its own dependencies demand.
+                  def bump(m):
+                      if int(m.group(2)) >= target:
+                          return m.group(0)
+                      sdk_fixed.append('%s: %s -> %d'
+                                       % (gradle.parent.parent.name, m.group(2), target))
+                      return m.group(1) + str(target)
+
+                  new = re.sub(
+                      r'(?m)^([ \t]*compileSdk(?:Version)?[ \t]*[= ]?[ \t]*)(\d+)',
+                      bump, src,
+                  )
+                  if new != src:
+                      src, changed = new, True
+
+                  if changed:
+                      gradle.write_text(src, encoding='utf-8')
+          print('🧩 legacy plugin patches — namespace: %s; compileSdk: %s'
+                % (', '.join(ns_fixed) or 'none needed',
+                   ', '.join(sdk_fixed) or 'none needed'))
+          PY
+      - name: Build the release APK
+        timeout-minutes: 30
+        run: flutter build apk --release
 
       - name: Upload the APK
         uses: actions/upload-artifact@v4
@@ -245,20 +390,15 @@ jobs:
           # GitHub storage is not a CDN.
           retention-days: 7
 
+      - name: Build the Play bundle (best effort)
+        timeout-minutes: 20
+        continue-on-error: true
+        run: flutter build appbundle --release
+
       - name: Upload the Play bundle (AAB)
         uses: actions/upload-artifact@v4
         with:
           name: app-bundle
           path: build/app/outputs/bundle/release/app-release.aab
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Upload the signing key (keep it — Play ties updates to it)
-        uses: actions/upload-artifact@v4
-        with:
-          name: signing-key
-          path: |
-            android/app/release.keystore
-            android/key.properties
           if-no-files-found: warn
           retention-days: 7
